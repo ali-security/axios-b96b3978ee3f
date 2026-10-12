@@ -226,6 +226,46 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  it('should sanitize request headers containing CRLF characters', async function () {
+    this.timeout(10000);
+    const server = await startHTTPServer(
+      (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ xTest: req.headers['x-test'], injected: req.headers.injected === undefined ? null : req.headers.injected }));
+      },
+      { port: 4444 }
+    );
+    try {
+      const { data } = await axios.get(`http://localhost:${server.address().port}/`, {
+        headers: { 'x-test': '\tok\r\nInjected: yes ' },
+      });
+      assert.strictEqual(data.xTest, 'okInjected: yes');
+      assert.strictEqual(data.injected, null);
+    } finally {
+      await stopHTTPServer(server);
+    }
+  });
+
+  it('should sanitize CRLF header values assigned directly in a request interceptor', async function () {
+    this.timeout(10000);
+    const instance = axios.create();
+
+    instance.interceptors.request.use((config) => {
+      config.headers['x-amz-target'] = 'dummy\r\n\r\nPUT /latest/api/token HTTP/1.1\r\nHost: 169.254.169.254\r\n\r\n';
+      return config;
+    });
+
+    server = await startHTTPServer((req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ target: req.headers['x-amz-target'], host: req.headers.host }));
+    }, { port: 4444 });
+
+    const { data } = await instance.get('http://localhost:4444/');
+
+    assert.strictEqual(data.target, 'dummyPUT /latest/api/token HTTP/1.1Host: 169.254.169.254');
+    assert.strictEqual(data.host, 'localhost:4444');
+  });
+
   it('should parse the timeout property', function (done) {
 
     server = http.createServer(function (req, res) {
