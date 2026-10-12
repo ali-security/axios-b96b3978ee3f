@@ -6,12 +6,19 @@ import axios from "../../../index.js";
 import utils from "../../../lib/utils.js";
 import mergeConfig from "../../../lib/core/mergeConfig.js";
 import defaults from "../../../lib/defaults/index.js";
+import AxiosHeaders from "../../../lib/core/AxiosHeaders.js";
 
 describe("Prototype Pollution Protection", function () {
   afterEach(function () {
     // Clean up any pollution that might have occurred
     delete Object.prototype.polluted;
     delete Object.prototype.validateStatus;
+    delete Object.prototype.parseReviver;
+    delete Object.prototype.responseType;
+    delete Object.prototype.transitional;
+    delete Object.prototype.formSerializer;
+    delete Object.prototype.env;
+    delete Object.prototype.response;
   });
 
   describe("utils.merge", function () {
@@ -272,6 +279,177 @@ describe("Prototype Pollution Protection", function () {
           server.close(resolve);
         });
       }
+    });
+  });
+
+  // CVE-2026-42044 (GHSA-3w6x-2g7m-8v23): the default transformRequest /
+  // transformResponse must only read options that are own properties of the
+  // config, never values inherited from a polluted Object.prototype.
+  describe("CVE-2026-42044 default transform gadgets", function () {
+    const transformRequest = defaults.transformRequest[0];
+    const transformResponse = defaults.transformResponse[0];
+
+    function tamperingReviver(key, value) {
+      if (key === "isAdmin") return true;
+      if (key === "role") return "admin";
+      if (key === "balance") return 999999;
+      return value;
+    }
+
+    it("should ignore a polluted parseReviver in transformResponse", function () {
+      Object.prototype.parseReviver = tamperingReviver;
+
+      const data = transformResponse.call(
+        {},
+        '{"isAdmin":false,"role":"viewer","balance":100}',
+      );
+
+      assert.strictEqual(data.isAdmin, false);
+      assert.strictEqual(data.role, "viewer");
+      assert.strictEqual(data.balance, 100);
+    });
+
+    it("should not let a polluted parseReviver tamper with axios JSON responses", async function () {
+      this.timeout(10000);
+
+      const server = http.createServer(function (req, res) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end('{"isAdmin":false,"role":"viewer","balance":100}');
+      });
+
+      await new Promise(function (resolve) {
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const { port } = server.address();
+
+      Object.prototype.parseReviver = tamperingReviver;
+
+      try {
+        const response = await axios.get(`http://127.0.0.1:${port}/`);
+
+        assert.strictEqual(response.data.isAdmin, false);
+        assert.strictEqual(response.data.role, "viewer");
+        assert.strictEqual(response.data.balance, 100);
+      } finally {
+        delete Object.prototype.parseReviver;
+        await new Promise(function (resolve) {
+          server.close(resolve);
+        });
+      }
+    });
+
+    it("should ignore a polluted transitional in transformResponse", function () {
+      Object.prototype.transitional = {
+        silentJSONParsing: true,
+        forcedJSONParsing: false,
+      };
+
+      const data = transformResponse.call({}, '{"foo":"bar"}');
+
+      assert.strictEqual(typeof data, "object");
+      assert.strictEqual(data.foo, "bar");
+    });
+
+    it("should ignore a polluted responseType in transformResponse", function () {
+      Object.prototype.responseType = "text";
+
+      const data = transformResponse.call(
+        { transitional: defaults.transitional },
+        '{"foo":"bar"}',
+      );
+
+      assert.strictEqual(typeof data, "object");
+      assert.strictEqual(data.foo, "bar");
+    });
+
+    it("should not attach a polluted response to JSON parse errors", function () {
+      Object.prototype.response = { status: 200, data: "spoofed" };
+
+      let error;
+      try {
+        transformResponse.call(
+          {
+            transitional: { silentJSONParsing: false, forcedJSONParsing: true },
+            responseType: "json",
+          },
+          "{invalid",
+        );
+      } catch (err) {
+        error = err;
+      }
+
+      assert.ok(error, "expected a JSON parse error");
+      assert.strictEqual(error.code, "ERR_BAD_RESPONSE");
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(error, "response"), false);
+      assert.strictEqual(Object.prototype.hasOwnProperty.call(error, "status"), false);
+    });
+
+    it("should ignore a polluted formSerializer in transformRequest", function () {
+      const payload = { user: { name: "alice" } };
+      const urlencoded = function () {
+        return new AxiosHeaders({
+          "Content-Type": "application/x-www-form-urlencoded",
+        });
+      };
+
+      const expected = transformRequest.call({}, payload, urlencoded());
+
+      Object.prototype.formSerializer = {
+        visitor: function () {
+          this.append("isAdmin", "true");
+          return false;
+        },
+      };
+
+      const actual = transformRequest.call({}, payload, urlencoded());
+
+      assert.strictEqual(actual, expected);
+      assert.strictEqual(actual.indexOf("isAdmin"), -1);
+    });
+
+    it("should ignore a polluted env.FormData in transformRequest", function () {
+      let constructed = false;
+
+      function SpoofedFormData() {
+        constructed = true;
+        this.entries = [];
+      }
+
+      SpoofedFormData.prototype.append = function (key, value) {
+        this.entries.push([key, value]);
+      };
+
+      Object.prototype.env = { FormData: SpoofedFormData };
+
+      const result = transformRequest.call(
+        {},
+        { foo: "bar" },
+        new AxiosHeaders({ "Content-Type": "multipart/form-data" }),
+      );
+
+      assert.strictEqual(constructed, false);
+      assert.strictEqual(result instanceof SpoofedFormData, false);
+    });
+
+    it("should still honour own config values", function () {
+      const data = transformResponse.call(
+        {
+          transitional: defaults.transitional,
+          parseReviver: function (key, value) {
+            return key === "foo" ? "own" : value;
+          },
+        },
+        '{"foo":"bar"}',
+      );
+
+      assert.strictEqual(data.foo, "own");
+
+      const text = transformResponse.call(
+        { transitional: defaults.transitional, responseType: "text" },
+        '{"foo":"bar"}',
+      );
+
+      assert.strictEqual(text, '{"foo":"bar"}');
     });
   });
 });
