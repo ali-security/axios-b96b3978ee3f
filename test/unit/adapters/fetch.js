@@ -485,6 +485,113 @@ describe('supports fetch with nodejs', function () {
     assert.strictEqual(headers.get('foo'), 'bar');
   });
 
+  it('should pass a fully resolved Request and safe options to a custom fetch implementation', async function () {
+    let captured;
+    const fetchOptions = Object.create({
+      headers: {
+        'X-Injected': 'yes'
+      }
+    });
+    fetchOptions.cache = 'no-store';
+    fetchOptions.redirect = 'error';
+    fetchOptions.customOption = 'custom-value';
+    fetchOptions.credentials = 'omit';
+    fetchOptions.duplex = 'full';
+
+    const customFetch = function (input, init) {
+      captured = {
+        input,
+        init,
+        argumentCount: arguments.length
+      };
+      return Promise.resolve(new Response('ok'));
+    };
+
+    const response = await fetchAxios.get('/custom-fetch', {
+      headers: {
+        'X-Safe': 'value'
+      },
+      withCredentials: true,
+      fetchOptions,
+      env: {
+        fetch: customFetch
+      }
+    });
+
+    assert.strictEqual(response.data, 'ok');
+    assert.ok(captured.input instanceof Request);
+    assert.strictEqual(captured.input.headers.get('X-Safe'), 'value');
+    assert.strictEqual(captured.input.headers.get('X-Injected'), null);
+    assert.strictEqual(captured.input.cache, 'no-store');
+    assert.strictEqual(captured.input.redirect, 'error');
+    assert.strictEqual(captured.input.credentials, 'include');
+    if ('duplex' in Request.prototype) {
+      assert.strictEqual(captured.input.duplex, 'half');
+    }
+    assert.strictEqual(Object.getPrototypeOf(captured.init), null);
+    assert.strictEqual(captured.init.cache, 'no-store');
+    assert.strictEqual(captured.init.redirect, 'error');
+    assert.strictEqual(captured.init.customOption, 'custom-value');
+    assert.strictEqual(captured.init.body, undefined);
+    assert.strictEqual(captured.init.headers, undefined);
+    assert.strictEqual(captured.init.method, undefined);
+    assert.strictEqual(captured.init.signal, undefined);
+    assert.strictEqual(captured.init.credentials, undefined);
+    assert.strictEqual(captured.init.duplex, undefined);
+    assert.strictEqual(captured.argumentCount, 2);
+  });
+
+  it('should ignore Request options inherited only from Object.prototype', async function () {
+    let captured;
+
+    Object.prototype.cache = 'no-store';
+    Object.prototype.redirect = 'manual';
+
+    try {
+      const response = await fetchAxios.get('/safe-request-options', {
+        env: {
+          fetch(input) {
+            captured = input;
+            return Promise.resolve(new Response('ok'));
+          }
+        }
+      });
+
+      assert.strictEqual(response.data, 'ok');
+      assert.ok(captured instanceof Request);
+      assert.strictEqual(captured.cache, 'default');
+      assert.strictEqual(captured.redirect, 'follow');
+    } finally {
+      delete Object.prototype.cache;
+      delete Object.prototype.redirect;
+    }
+  });
+
+  it('should expose an unfollowed redirect response in Node when maxRedirects is zero', async function () {
+    let finalRequests = 0;
+
+    server = await startHTTPServer((req, res) => {
+      if (req.url === '/start') {
+        res.writeHead(302, { Location: '/final' });
+        res.end();
+        return;
+      }
+
+      finalRequests++;
+      res.end('followed');
+    });
+
+    const response = await fetchAxios.get(`http://localhost:${server.address().port}/start`, {
+      maxRedirects: 0,
+      validateStatus: () => true
+    });
+
+    // Node exposes manual redirect responses; browsers return an opaque
+    // redirect whose status and headers cannot be inspected.
+    assert.strictEqual(response.status, 302);
+    assert.strictEqual(finalRequests, 0);
+  });
+
   describe('fetch adapter - Content-Type handling', function () {
     it('should set correct Content-Type for FormData automatically', async function () {
       const FormData = (await import('form-data')).default; // Node FormData
@@ -544,6 +651,36 @@ describe('supports fetch with nodejs', function () {
 
       assert.strictEqual(headers.get('foo'), '1');
       assert.strictEqual(data, 'test');
+    });
+
+    it('should pass safe options when the Request object is unavailable', async () => {
+      let captured;
+
+      Object.prototype.cache = 'no-store';
+      Object.prototype.redirect = 'manual';
+
+      try {
+        const { data } = await fetchAxios.get('/', {
+          env: {
+            Request: null,
+            fetch(_url, init) {
+              captured = init;
+              return {
+                headers: {},
+                text: async () => 'test'
+              };
+            }
+          }
+        });
+
+        assert.strictEqual(data, 'test');
+        assert.strictEqual(Object.getPrototypeOf(captured), null);
+        assert.strictEqual(captured.cache, undefined);
+        assert.strictEqual(captured.redirect, undefined);
+      } finally {
+        delete Object.prototype.cache;
+        delete Object.prototype.redirect;
+      }
     });
 
     it('should be able to handle response with lack of Response object', async() => {

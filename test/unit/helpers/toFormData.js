@@ -174,4 +174,92 @@ describe('helpers::toFormData', function () {
       assertDepthError(() => buildURL('/foo', nest(10000)));
     });
   });
+
+  describe('options inherited from Object.prototype (GHSA-x97p-jq2g-jp4f)', function () {
+    function createFormDataSpy() {
+      return {
+        calls: [],
+        append(key, value) {
+          this.calls.push([key, value]);
+        }
+      };
+    }
+
+    it('should ignore a visitor inherited only from Object.prototype', function () {
+      let called = false;
+      Object.prototype.visitor = () => {
+        called = true;
+        return false;
+      };
+
+      try {
+        const formData = createFormDataSpy();
+        toFormData({ field: 'value' }, formData);
+
+        assert.strictEqual(called, false);
+        assert.deepStrictEqual(formData.calls, [['field', 'value']]);
+      } finally {
+        delete Object.prototype.visitor;
+      }
+    });
+
+    it('should ignore maxDepth inherited only from Object.prototype', function () {
+      Object.prototype.maxDepth = 0;
+
+      try {
+        const formData = createFormDataSpy();
+        assert.doesNotThrow(() => toFormData({ nested: { field: 'value' } }, formData));
+        assert.deepStrictEqual(formData.calls, [['nested[field]', 'value']]);
+      } finally {
+        delete Object.prototype.maxDepth;
+      }
+    });
+
+    it('should ignore inherited options on the urlencoded and params serialization paths', function () {
+      let called = false;
+      Object.prototype.maxDepth = 0;
+
+      try {
+        assert.doesNotThrow(() => toURLEncodedForm({ nested: { field: 'value' } }));
+        assert.doesNotThrow(() => new AxiosURLSearchParams({ nested: { field: 'value' } }));
+      } finally {
+        delete Object.prototype.maxDepth;
+      }
+
+      Object.prototype.visitor = () => {
+        called = true;
+        return false;
+      };
+
+      try {
+        const params = new AxiosURLSearchParams({ field: 'value' });
+
+        assert.strictEqual(called, false);
+        assert.strictEqual(params.toString(), 'field=value');
+      } finally {
+        delete Object.prototype.visitor;
+      }
+    });
+
+    it('should still honor explicitly provided options', function () {
+      const formData = createFormDataSpy();
+      let visited = 0;
+
+      toFormData({ nested: { field: 'value' } }, formData, {
+        dots: true,
+        visitor(value, key, path, helpers) {
+          visited++;
+          return helpers.defaultVisitor.call(this, value, key, path, helpers);
+        }
+      });
+
+      assert.ok(visited > 0);
+      assert.deepStrictEqual(formData.calls, [['nested.field', 'value']]);
+
+      assert.throws(
+        () => toFormData({ nested: { field: 'value' } }, createFormDataSpy(), { maxDepth: 0 }),
+        (err) => err instanceof AxiosError && err.code === 'ERR_FORM_DATA_DEPTH_EXCEEDED'
+      );
+    });
+  });
 });
