@@ -53,6 +53,19 @@ describe('utils', function (){
       }
       assert.equal(utils.isFormData(new FormData()), true);
     });
+
+    it('should not detect plain objects as FormData when Object.prototype is polluted', () => {
+      Object.prototype[Symbol.toStringTag] = 'FormData';
+      Object.prototype.append = () => {};
+
+      try {
+        assert.equal(utils.isFormData({userId: 42}), false);
+        assert.equal(utils.isFormData(Object.create(null)), false);
+      } finally {
+        delete Object.prototype.append;
+        delete Object.prototype[Symbol.toStringTag];
+      }
+    });
   });
 
   describe('toJSON', function (){
