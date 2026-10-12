@@ -7,6 +7,7 @@ import utils from "../../../lib/utils.js";
 import mergeConfig from "../../../lib/core/mergeConfig.js";
 import defaults from "../../../lib/defaults/index.js";
 import AxiosHeaders from "../../../lib/core/AxiosHeaders.js";
+import httpAdapter from "../../../lib/adapters/http.js";
 
 const nodeMajorVersion = parseInt(process.versions.node.split('.')[0], 10);
 
@@ -46,6 +47,14 @@ describe("Prototype Pollution Protection", function () {
     delete Object.prototype.fetchOptions;
     delete Object.prototype.transformRequest;
     delete Object.prototype.transformResponse;
+    delete Object.prototype.transport;
+    delete Object.prototype.lookup;
+    delete Object.prototype.family;
+    delete Object.prototype.responseEncoding;
+    delete Object.prototype.data;
+    delete Object.prototype.headers;
+    delete Object.prototype.xsrfCookieName;
+    delete Object.prototype.xsrfHeaderName;
   });
 
   describe("utils.merge", function () {
@@ -226,6 +235,43 @@ describe("Prototype Pollution Protection", function () {
       assert.strictEqual(Object.prototype.polluted, undefined);
       assert.strictEqual(result.customProp.safe, "value");
       assert.strictEqual(result.customProp.hasOwnProperty("__proto__"), false);
+    });
+
+    it("should not inherit transport from Object.prototype", function () {
+      Object.prototype.transport = { request: function () {} };
+      const result = mergeConfig({}, { url: "/a" });
+      assert.strictEqual(result.hasOwnProperty("transport"), false);
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "transport"),
+        false
+      );
+    });
+
+    it("should not inherit transformRequest from Object.prototype", function () {
+      Object.prototype.transformRequest = function () { return "hijacked"; };
+      const result = mergeConfig({}, { url: "/a" });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "transformRequest"),
+        false
+      );
+    });
+
+    it("should not inherit transformResponse from Object.prototype", function () {
+      Object.prototype.transformResponse = function () { return "hijacked"; };
+      const result = mergeConfig({}, { url: "/a" });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "transformResponse"),
+        false
+      );
+    });
+
+    it("should not inherit arbitrary keys from Object.prototype", function () {
+      Object.prototype.polluted = "yes";
+      const result = mergeConfig({}, { url: "/a" });
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(result, "polluted"),
+        false
+      );
     });
 
     it("should still merge configs correctly", function () {
@@ -1006,6 +1052,408 @@ describe("Prototype Pollution Protection", function () {
       } finally {
         await stop(server);
       }
+    });
+  });
+
+  function startEchoServer() {
+    return new Promise(function (resolve) {
+      const server = http.createServer(function (req, res) {
+        let body = "";
+        req.on("data", function (chunk) {
+          body += chunk;
+        });
+        req.on("end", function () {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            url: req.url,
+            method: req.method,
+            headers: req.headers,
+            body: body,
+          }));
+        });
+      });
+      server.listen(0, "127.0.0.1", function () {
+        resolve(server);
+      });
+    });
+  }
+
+  function stopEchoServer(server) {
+    return new Promise(function (resolve) {
+      server.close(resolve);
+    });
+  }
+
+  // CVE-2026-44495 (GHSA-3g43-6gmg-66jw): mergeConfig must only read own
+  // properties of config1/config2. A key that is own on one side (e.g. the
+  // defaults' transformResponse) must never pick up a polluted
+  // Object.prototype value from the other side, otherwise the gadget is copied
+  // into the merged config as an own property and bypasses every later
+  // hasOwnProperty / null-prototype defense.
+  describe("CVE-2026-44495 mergeConfig inherited value reads", function () {
+    it("should not let a polluted transformResponse override the defaults", function () {
+      const polluted = function pollutedTransformResponse() {
+        return "HIJACKED";
+      };
+      Object.prototype.transformResponse = polluted;
+
+      const merged = mergeConfig(defaults, { url: "/x" });
+
+      assert.notStrictEqual(merged.transformResponse, polluted);
+      assert.deepStrictEqual(merged.transformResponse, defaults.transformResponse);
+    });
+
+    it("should not let polluted keys override any default value", function () {
+      const keys = [
+        "adapter",
+        "transformRequest",
+        "transformResponse",
+        "timeout",
+        "xsrfCookieName",
+        "xsrfHeaderName",
+        "maxContentLength",
+        "maxBodyLength",
+        "env",
+        "transitional",
+        "headers",
+      ];
+
+      keys.forEach(function (key) {
+        const sentinel = { __pollutedMarker: key };
+        Object.prototype[key] = sentinel;
+        try {
+          const merged = mergeConfig(defaults, { url: "/x" });
+          const value = merged[key];
+          assert.notStrictEqual(value, sentinel, key + " was taken from Object.prototype");
+          assert.ok(
+            !(value && Object.prototype.hasOwnProperty.call(value, "__pollutedMarker")),
+            key + " was merged with Object.prototype." + key
+          );
+        } finally {
+          delete Object.prototype[key];
+        }
+      });
+    });
+
+    it("should not merge polluted headers read from config1", function () {
+      Object.prototype.headers = { "X-Injected": "evil" };
+
+      const merged = mergeConfig({}, { headers: { "X-Own": "1" } });
+
+      assert.strictEqual(merged.headers["X-Own"], "1");
+      assert.strictEqual(
+        Object.prototype.hasOwnProperty.call(merged.headers, "X-Injected"),
+        false
+      );
+    });
+
+    it("should not leak credentials to a polluted transformResponse via axios(config)", async function () {
+      this.timeout(10000);
+      const server = await startEchoServer();
+      const { port } = server.address();
+
+      let invoked = false;
+      let leaked;
+      Object.prototype.transformResponse = function pollutedTransformResponse() {
+        invoked = true;
+        leaked = this && this.auth ? this.auth.username + ":" + this.auth.password : undefined;
+        return "HIJACKED";
+      };
+
+      try {
+        const res = await axios({
+          url: `http://127.0.0.1:${port}/secret`,
+          method: "get",
+          auth: { username: "user", password: "s3cret" },
+        });
+
+        assert.strictEqual(invoked, false);
+        assert.strictEqual(leaked, undefined);
+        assert.notStrictEqual(res.data, "HIJACKED");
+        assert.strictEqual(res.data.url, "/secret");
+      } finally {
+        delete Object.prototype.transformResponse;
+        await stopEchoServer(server);
+      }
+    });
+
+    it("should not run a polluted transformRequest via axios.request(config)", async function () {
+      this.timeout(10000);
+      const server = await startEchoServer();
+      const { port } = server.address();
+
+      let invoked = false;
+      Object.prototype.transformRequest = function pollutedTransformRequest() {
+        invoked = true;
+        return "INJECTED";
+      };
+
+      try {
+        const res = await axios.request({
+          url: `http://127.0.0.1:${port}/`,
+          method: "post",
+          data: { hello: "world" },
+        });
+
+        assert.strictEqual(invoked, false);
+        assert.strictEqual(res.data.body, JSON.stringify({ hello: "world" }));
+      } finally {
+        delete Object.prototype.transformRequest;
+        await stopEchoServer(server);
+      }
+    });
+
+    it("should not dispatch through a polluted adapter via axios(config)", async function () {
+      this.timeout(10000);
+      const server = await startEchoServer();
+      const { port } = server.address();
+
+      let hijacked = false;
+      Object.prototype.adapter = function pollutedAdapter(config) {
+        hijacked = true;
+        return Promise.resolve({
+          data: "pwned",
+          status: 200,
+          statusText: "OK",
+          headers: {},
+          config: config,
+          request: {},
+        });
+      };
+
+      try {
+        const res = await axios({ url: `http://127.0.0.1:${port}/ok` });
+
+        assert.strictEqual(hijacked, false);
+        assert.strictEqual(res.data.url, "/ok");
+      } finally {
+        delete Object.prototype.adapter;
+        await stopEchoServer(server);
+      }
+    });
+
+    it("should not bake a polluted transformResponse into axios.create() defaults", function () {
+      const polluted = function pollutedTransformResponse() {
+        return "HIJACKED";
+      };
+      Object.prototype.transformResponse = polluted;
+
+      let instance;
+      try {
+        instance = axios.create();
+      } finally {
+        delete Object.prototype.transformResponse;
+      }
+
+      assert.notStrictEqual(instance.defaults.transformResponse, polluted);
+      assert.deepStrictEqual(instance.defaults.transformResponse, defaults.transformResponse);
+    });
+
+    it("should not inject polluted headers into axios.post requests", async function () {
+      this.timeout(10000);
+      const server = await startEchoServer();
+      const { port } = server.address();
+
+      Object.prototype.headers = { "X-Injected": "evil" };
+
+      let res;
+      try {
+        res = await axios.post(`http://127.0.0.1:${port}/`, { hello: "world" });
+      } finally {
+        delete Object.prototype.headers;
+        await stopEchoServer(server);
+      }
+
+      assert.strictEqual(res.data.headers["x-injected"], undefined);
+      assert.strictEqual(res.data.body, JSON.stringify({ hello: "world" }));
+    });
+
+    it("should still honour own config values", async function () {
+      this.timeout(10000);
+      const server = await startEchoServer();
+      const { port } = server.address();
+
+      let invoked = false;
+      try {
+        const res = await axios({
+          url: `http://127.0.0.1:${port}/own`,
+          headers: { "X-Own": "1" },
+          transformResponse: [function (data) {
+            invoked = true;
+            return JSON.parse(data);
+          }],
+        });
+
+        assert.strictEqual(invoked, true);
+        assert.strictEqual(res.data.url, "/own");
+        assert.strictEqual(res.data.headers["x-own"], "1");
+      } finally {
+        await stopEchoServer(server);
+      }
+    });
+  });
+
+  // The http adapter must only read own config properties, so a config that is
+  // a plain object (e.g. returned as `{...config}` by a request interceptor, or
+  // passed directly to the exported adapter) cannot inherit gadgets such as
+  // transport, lookup, family, responseType, responseEncoding, data or env from
+  // a polluted Object.prototype.
+  describe("CVE-2026-44495 http adapter own config reads", function () {
+    function createSpreadingInstance() {
+      const instance = axios.create();
+      instance.interceptors.request.use(function (config) {
+        return Object.assign({}, config);
+      });
+      return instance;
+    }
+
+    it("should not route requests through a polluted transport", async function () {
+      this.timeout(10000);
+      const server = await startEchoServer();
+      const { port } = server.address();
+      const instance = createSpreadingInstance();
+
+      let hijacked = false;
+      Object.prototype.transport = {
+        request: function () {
+          hijacked = true;
+          return http.request.apply(http, arguments);
+        },
+      };
+
+      try {
+        const res = await instance.get(`http://127.0.0.1:${port}/transport`);
+
+        assert.strictEqual(hijacked, false);
+        assert.strictEqual(res.data.url, "/transport");
+      } finally {
+        delete Object.prototype.transport;
+        await stopEchoServer(server);
+      }
+    });
+
+    it("should not pass a polluted lookup or family to http.request", async function () {
+      this.timeout(10000);
+      const server = await startEchoServer();
+      const { port } = server.address();
+      const instance = createSpreadingInstance();
+
+      let captured;
+      const origRequest = http.request;
+      http.request = function (options) {
+        captured = { lookup: options.lookup, family: options.family };
+        return origRequest.apply(this, arguments);
+      };
+
+      Object.prototype.lookup = function pollutedLookup(hostname, opts, cb) {
+        cb(null, "127.0.0.1", 4);
+      };
+      Object.prototype.family = 6;
+
+      try {
+        try {
+          await instance.get(`http://127.0.0.1:${port}/`, { maxRedirects: 0 });
+        } catch (_) {
+          // the outcome of the request itself is irrelevant here
+        }
+      } finally {
+        delete Object.prototype.lookup;
+        delete Object.prototype.family;
+        http.request = origRequest;
+        await stopEchoServer(server);
+      }
+
+      assert.ok(captured, "http.request should have been called");
+      assert.strictEqual(captured.lookup, undefined);
+      assert.strictEqual(captured.family, undefined);
+    });
+
+    it("should ignore a polluted responseType", async function () {
+      this.timeout(10000);
+      const server = await startEchoServer();
+      const { port } = server.address();
+      const instance = createSpreadingInstance();
+
+      Object.prototype.responseType = "arraybuffer";
+
+      try {
+        const res = await instance.get(`http://127.0.0.1:${port}/type`);
+
+        assert.ok(!Buffer.isBuffer(res.data));
+        assert.strictEqual(res.data.url, "/type");
+      } finally {
+        delete Object.prototype.responseType;
+        await stopEchoServer(server);
+      }
+    });
+
+    it("should ignore a polluted responseEncoding", async function () {
+      this.timeout(10000);
+      const server = await startEchoServer();
+      const { port } = server.address();
+      const instance = createSpreadingInstance();
+
+      Object.prototype.responseEncoding = "base64";
+
+      try {
+        const res = await instance.get(`http://127.0.0.1:${port}/encoding`);
+
+        assert.strictEqual(typeof res.data, "object");
+        assert.strictEqual(res.data.url, "/encoding");
+      } finally {
+        delete Object.prototype.responseEncoding;
+        await stopEchoServer(server);
+      }
+    });
+
+    it("should not send a polluted data as the request body", async function () {
+      this.timeout(10000);
+      const server = await startEchoServer();
+      const { port } = server.address();
+
+      Object.prototype.data = "INJECTED_BODY";
+
+      let res;
+      try {
+        res = await httpAdapter({
+          url: `http://127.0.0.1:${port}/data`,
+          method: "post",
+          headers: new AxiosHeaders(),
+          maxRedirects: 0,
+        });
+      } finally {
+        delete Object.prototype.data;
+        await stopEchoServer(server);
+      }
+
+      const echoed = JSON.parse(res.data);
+      assert.strictEqual(echoed.url, "/data");
+      assert.strictEqual(echoed.body, "");
+    });
+
+    it("should not construct a polluted env.Blob for data: URIs", async function () {
+      let hijacked = false;
+      Object.prototype.env = {
+        Blob: function PollutedBlob() {
+          hijacked = true;
+        },
+      };
+
+      try {
+        try {
+          await httpAdapter({
+            url: "data:text/plain;base64,SGVsbG8=",
+            method: "get",
+            responseType: "blob",
+          });
+        } catch (_) {
+          // Blob may be unsupported on older Node versions
+        }
+      } finally {
+        delete Object.prototype.env;
+      }
+
+      assert.strictEqual(hijacked, false);
     });
   });
 
