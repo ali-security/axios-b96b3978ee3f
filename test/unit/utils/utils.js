@@ -68,6 +68,103 @@ describe('utils', function (){
     });
   });
 
+  describe('utils::isX', function () {
+    it('should ignore inherited symbol properties when validating plain Object', function () {
+      try {
+        Object.prototype[Symbol.iterator] = function* () {
+          yield ['x-injected', 'yes'];
+        };
+        Object.prototype[Symbol.toStringTag] = 'Custom';
+
+        assert.strictEqual(utils.isPlainObject({}), true);
+        assert.strictEqual(utils.isPlainObject([]), false);
+        assert.strictEqual(
+          utils.isPlainObject({
+            [Symbol.iterator]: function* () {
+              yield ['x-own', 'yes'];
+            }
+          }),
+          false
+        );
+        assert.strictEqual(
+          utils.isPlainObject({
+            [Symbol.toStringTag]: 'Custom'
+          }),
+          false
+        );
+      } finally {
+        delete Object.prototype[Symbol.iterator];
+        delete Object.prototype[Symbol.toStringTag];
+      }
+    });
+
+    it('should treat an object with a genuinely inherited iterator as non-plain', function () {
+      // Iterator inherited from a custom (non-Object.prototype) source: this is a
+      // real iterable, not prototype pollution, so it must not be classified plain.
+      const proto = Object.create(null);
+      proto[Symbol.iterator] = function* () {
+        yield ['x', '1'];
+      };
+
+      assert.strictEqual(utils.isPlainObject(Object.create(proto)), false);
+    });
+
+    it('should not read polluted Object.prototype iterator accessors for safe iterable checks', function () {
+      let accessed = false;
+
+      try {
+        Object.defineProperty(Object.prototype, Symbol.iterator, {
+          configurable: true,
+          get() {
+            accessed = true;
+            throw new Error('polluted iterator accessor');
+          }
+        });
+
+        assert.strictEqual(utils.isSafeIterable({}), false);
+        assert.strictEqual(accessed, false);
+      } finally {
+        delete Object.prototype[Symbol.iterator];
+      }
+    });
+
+    it('should stop safe prototype-chain reads on cyclic Proxy prototypes', function () {
+      let calls = 0;
+      let proxy;
+      proxy = new Proxy({}, {
+        getPrototypeOf() {
+          calls += 1;
+          if (calls > 5) {
+            throw new Error('cycled');
+          }
+          return proxy;
+        }
+      });
+
+      assert.strictEqual(utils.hasOwnInPrototypeChain(proxy, 'missing'), false);
+      assert.strictEqual(utils.getSafeProp(proxy, 'missing'), undefined);
+      assert.ok(calls <= 2, `expected at most 2 getPrototypeOf calls, got ${calls}`);
+    });
+
+    it('should honor own and template-prototype members but ignore Object.prototype pollution in getSafeProp', function () {
+      try {
+        Object.prototype.polluted = 'injected';
+
+        const template = { inherited: 'template' };
+        const derived = Object.create(template);
+        derived.own = 'own';
+
+        assert.strictEqual(utils.getSafeProp(derived, 'own'), 'own');
+        assert.strictEqual(utils.getSafeProp(derived, 'inherited'), 'template');
+        assert.strictEqual(utils.getSafeProp(derived, 'polluted'), undefined);
+        assert.strictEqual(utils.getSafeProp({}, 'polluted'), undefined);
+        assert.strictEqual(utils.getSafeProp(null, 'polluted'), undefined);
+      } finally {
+        delete Object.prototype.polluted;
+      }
+    });
+  });
+
   describe('toJSON', function (){
     it('should convert to a plain object without circular references', function () {
       const obj= {a: [0]}

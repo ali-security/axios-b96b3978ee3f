@@ -1,4 +1,5 @@
 import Axios from "../../../lib/core/Axios.js";
+import axios from "../../../index.js";
 import assert from "assert";
 
 describe('Axios', function () {
@@ -49,5 +50,66 @@ describe('Axios', function () {
     const axios = new Axios();
 
     assert.deepStrictEqual(axios.defaults, {});
+  });
+
+  it('should ignore inherited data for bodyless method helpers', async function () {
+    Object.defineProperty(Object.prototype, 'data', {
+      value: 'inherited-body',
+      configurable: true,
+      writable: true
+    });
+
+    try {
+      await Promise.all(
+        ['delete', 'get', 'head', 'options'].map(async (method) => {
+          let seenData = 'unset';
+
+          await axios[method]('/test', {
+            adapter(config) {
+              seenData = config.data;
+
+              return Promise.resolve({
+                data: null,
+                status: 200,
+                statusText: 'OK',
+                headers: {},
+                config,
+                request: {}
+              });
+            }
+          });
+
+          assert.strictEqual(seenData, undefined, `${method} must not send inherited data`);
+        })
+      );
+    } finally {
+      delete Object.prototype.data;
+    }
+  });
+
+  it('should ignore inherited nested serializer fields in getUri', function () {
+    let serializeInvoked = false;
+
+    Object.defineProperty(Object.prototype, 'serialize', {
+      value() {
+        serializeInvoked = true;
+        return 'inherited=1';
+      },
+      configurable: true
+    });
+
+    try {
+      assert.strictEqual(
+        axios.getUri({
+          url: '/foo',
+          params: { value: 'a b' },
+          paramsSerializer: {}
+        }),
+        '/foo?value=a+b'
+      );
+      assert.strictEqual(serializeInvoked, false);
+    } finally {
+      delete Object.prototype.serialize;
+    }
   });
 });

@@ -22,7 +22,7 @@ const isBlobSupported = typeof Blob !== 'undefined';
 import {Throttle} from 'stream-throttle';
 import devNull from 'dev-null';
 import {AbortController} from 'abortcontroller-polyfill/dist/cjs-ponyfill.js';
-import {__setProxy} from "../../../lib/adapters/http.js";
+import httpAdapter, {__setProxy} from "../../../lib/adapters/http.js";
 import {FormData as FormDataPolyfill, Blob as BlobPolyfill, File as FilePolyfill} from 'formdata-node';
 
 const FormDataSpecCompliant = typeof FormData !== 'undefined' ? FormData : FormDataPolyfill;
@@ -779,6 +779,154 @@ describe('supports http with nodejs', function () {
     });
   });
 
+  it('should ignore inherited nested request option fields in http adapter', async function () {
+    server = await startHTTPServer(
+      (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(
+          JSON.stringify({
+            authorization: req.headers.authorization,
+            url: req.url
+          })
+        );
+      },
+      { port: 4444 }
+    );
+
+    // writable so internal code that assigns own `username`/`password`
+    // properties (e.g. URLContext on Node < 18) is not broken by the pollution
+    Object.defineProperty(Object.prototype, 'username', {
+      value: 'inherited-user',
+      configurable: true,
+      writable: true
+    });
+    Object.defineProperty(Object.prototype, 'password', {
+      value: 'inherited-pass',
+      configurable: true,
+      writable: true
+    });
+    Object.defineProperty(Object.prototype, 'serialize', {
+      value() {
+        return 'inherited=1';
+      },
+      configurable: true
+    });
+
+    try {
+      const response = await axios.get(`http://localhost:${server.address().port}/demo`, {
+        auth: {},
+        params: { value: 'a b' },
+        paramsSerializer: {}
+      });
+
+      assert.deepStrictEqual(response.data, {
+        authorization: 'Basic Og==',
+        url: '/demo?value=a+b'
+      });
+    } finally {
+      delete Object.prototype.username;
+      delete Object.prototype.password;
+      delete Object.prototype.serialize;
+    }
+  });
+
+  it('should ignore inherited proxy when http adapter receives a plain config', async function () {
+    const proxyEnvKeys = ['http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY'];
+    const originalProxyEnv = Object.create(null);
+    let proxyHits = 0;
+    let targetHits = 0;
+
+    for (const key of proxyEnvKeys) {
+      originalProxyEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+
+    try {
+      proxy = await startHTTPServer((req, res) => {
+        proxyHits += 1;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ via: 'proxy', url: req.url }));
+      }, { port: 0 });
+
+      server = await startHTTPServer((req, res) => {
+        targetHits += 1;
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ via: 'target', url: req.url }));
+      }, { port: 0 });
+
+      Object.defineProperty(Object.prototype, 'proxy', {
+        value: {
+          protocol: 'http',
+          host: '127.0.0.1',
+          port: proxy.address().port
+        },
+        configurable: true
+      });
+
+      const response = await httpAdapter({
+        method: 'get',
+        url: `http://127.0.0.1:${server.address().port}/direct`,
+        headers: {},
+        maxRedirects: 0,
+        maxContentLength: -1,
+        maxBodyLength: -1,
+        timeout: 0
+      });
+      const data = JSON.parse(response.data);
+
+      assert.strictEqual(proxyHits, 0);
+      assert.strictEqual(targetHits, 1);
+      assert.deepStrictEqual(data, { via: 'target', url: '/direct' });
+    } finally {
+      delete Object.prototype.proxy;
+
+      for (const key of proxyEnvKeys) {
+        if (originalProxyEnv[key] === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = originalProxyEnv[key];
+        }
+      }
+    }
+  });
+
+  it('should ignore inherited paramsSerializer when http adapter receives a plain config', async function () {
+    let serializerInvoked = false;
+
+    Object.defineProperty(Object.prototype, 'paramsSerializer', {
+      value() {
+        serializerInvoked = true;
+        return 'inherited=1';
+      },
+      configurable: true
+    });
+
+    try {
+      server = await startHTTPServer((req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ url: req.url }));
+      }, { port: 0 });
+
+      const response = await httpAdapter({
+        method: 'get',
+        url: `http://127.0.0.1:${server.address().port}/direct`,
+        headers: {},
+        params: { value: 'a b' },
+        proxy: false,
+        maxRedirects: 0,
+        maxContentLength: -1,
+        maxBodyLength: -1,
+        timeout: 0
+      });
+      const data = JSON.parse(response.data);
+
+      assert.strictEqual(serializerInvoked, false);
+      assert.deepStrictEqual(data, { url: '/direct?value=a+b' });
+    } finally {
+      delete Object.prototype.paramsSerializer;
+    }
+  });
+
   it('should provides a default User-Agent header', function (done) {
     server = http.createServer(function (req, res) {
       res.end(req.headers['user-agent']);
@@ -1020,6 +1168,86 @@ describe('supports http with nodejs', function () {
           headers: { 'Content-Type': 'application/octet-stream' },
         }
       );
+
+      assert.strictEqual(response.data.received, payload.length);
+    } finally {
+      await stopHTTPServer(server);
+    }
+  });
+
+  it('should enforce maxBodyLength for streamed uploads through a custom transport', async function () {
+    this.timeout(10000);
+    let bytesReceived = 0;
+    let transportUsed = false;
+    const server = await startHTTPServer(
+      (req, res) => {
+        req.on('data', (chunk) => { bytesReceived += chunk.length; });
+        req.on('error', () => {});
+        req.on('end', () => {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ received: bytesReceived }));
+        });
+      },
+      { port: 4444 }
+    );
+
+    // A user-supplied transport (unlike follow-redirects) does not apply
+    // options.maxBodyLength itself, even when maxRedirects > 0.
+    const customTransport = {
+      request() {
+        transportUsed = true;
+        return http.request.apply(http, arguments);
+      }
+    };
+
+    try {
+      const size = 2 * 1024 * 1024;
+      const source = stream.Readable.from([Buffer.alloc(size, 0x63)]);
+
+      await assert.rejects(
+        axios.post(`http://localhost:${server.address().port}/`, source, {
+          maxBodyLength: 1024,
+          maxRedirects: 5,
+          transport: customTransport,
+          headers: { 'Content-Type': 'application/octet-stream' },
+        }),
+        (error) => {
+          assert.strictEqual(error.message, 'Request body larger than maxBodyLength limit');
+          assert.strictEqual(error.code, AxiosError.ERR_BAD_REQUEST);
+          return true;
+        }
+      );
+
+      assert.ok(transportUsed, 'custom transport should have been used');
+      assert.ok(bytesReceived <= 1024 * 4, `server should not receive full payload; got ${bytesReceived}`);
+    } finally {
+      await stopHTTPServer(server);
+    }
+  });
+
+  it('should allow streamed uploads under maxBodyLength through a custom transport', async function () {
+    this.timeout(10000);
+    let bytesReceived = 0;
+    const server = await startHTTPServer(
+      (req, res) => {
+        req.on('data', (chunk) => { bytesReceived += chunk.length; });
+        req.on('end', () => {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ received: bytesReceived }));
+        });
+      },
+      { port: 4444 }
+    );
+
+    try {
+      const payload = Buffer.alloc(512, 0x64);
+      const source = stream.Readable.from([payload]);
+
+      const response = await axios.post(`http://localhost:${server.address().port}/`, source, {
+        maxBodyLength: 1024,
+        transport: http,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      });
 
       assert.strictEqual(response.data.received, payload.length);
     } finally {
@@ -2337,6 +2565,61 @@ describe('supports http with nodejs', function () {
     describe('prototype pollution (GHSA-6chq-wfr3-2hj9)', function () {
       const pollutedKeys = ['getHeaders', 'append', 'pipe', 'on', 'once'];
       const toStringTagSym = Symbol.toStringTag;
+
+      it('should not use inherited Symbol.iterator for request or response headers', async function () {
+        this.timeout(10000);
+        let capturedHeaders;
+        const stubTransport = {
+          request(options, handleResponse) {
+            capturedHeaders = { ...options.headers };
+            const req = new EventEmitter();
+            req.write = () => true;
+            req.setTimeout = () => {};
+            req.destroy = () => {};
+            req.end = () => {
+              const res = new stream.Readable({ read() {} });
+              res.statusCode = 200;
+              res.statusMessage = 'OK';
+              res.headers = { 'x-server': 'real' };
+              res.rawHeaders = [];
+              res.req = req;
+              process.nextTick(() => {
+                handleResponse(res);
+                res.push(null);
+              });
+            };
+            return req;
+          },
+        };
+
+        try {
+          Object.prototype[Symbol.iterator] = function* () {
+            yield ['X-Injected', 'yes'];
+            yield ['Authorization', 'Bearer CHANGED'];
+          };
+
+          const response = await axios.get('http://stub.invalid/', {
+            headers: {
+              Authorization: 'Bearer VALID_USER_TOKEN',
+              'X-App': 'safe'
+            },
+            transport: stubTransport,
+            maxRedirects: 0
+          });
+
+          assert.ok(capturedHeaders, 'transport was not invoked');
+          assert.strictEqual(capturedHeaders['X-App'], 'safe');
+          assert.strictEqual(
+            capturedHeaders.Authorization || capturedHeaders.authorization,
+            'Bearer VALID_USER_TOKEN'
+          );
+          assert.strictEqual(capturedHeaders['X-Injected'] || capturedHeaders['x-injected'], undefined);
+          assert.strictEqual(response.headers.get('x-server'), 'real');
+          assert.strictEqual(response.headers.get('x-injected'), undefined);
+        } finally {
+          delete Object.prototype[Symbol.iterator];
+        }
+      });
 
       function pollute() {
         Object.prototype[toStringTagSym] = 'FormData';
