@@ -1,6 +1,5 @@
 name: "PR Labeler"
 on:
-  pull_request_target:
   workflow_dispatch:
     inputs:
       prs:
